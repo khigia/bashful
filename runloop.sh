@@ -53,7 +53,7 @@ function do_start() {
     echo "$CMD_PID STOP" >> $CMD_PID_FILE
     if [ $CMD_RET -eq 0 ]
     then
-      echo "`$LOGH`: monitor: stop: normal end of command" >> $MON_LOG_FILE
+      echo "`$LOGH`: monitor: loop: normal end of command" >> $MON_LOG_FILE
       echo "STOP" >> $MON_PID_FILE
       break
     else
@@ -81,20 +81,18 @@ function do_start() {
 }
 
 function do_stop() {
-  echo "STOP REQUEST" >> $MON_PID_FILE
+  LOCAL_CMD_PID_FILE=$1
+  LOCAL_MON_PID_FILE=$2
+  echo "STOP REQUEST" >> $LOCAL_MON_PID_FILE
   #TODO can fail
-  tail -1 $CMD_PID_FILE | cut -f1 -d' ' | xargs kill
+  tail -1 $LOCAL_CMD_PID_FILE | cut -f1 -d' ' | xargs kill
   #TODO wait and kill -9 if needed ...
   return 0
 }
 
 function do_status() {
-  #TODO can fail
   LOCAL_CMD_PID_FILE=$1
-  if [ "$LOCAL_CMD_PID_FILE" == "" ]
-  then
-    LOCAL_CMD_PID_FILE=$CMD_PID_FILE
-  fi
+  #TODO can fail
   PID=`tail -1 $LOCAL_CMD_PID_FILE | cut -f1 -d' '`
   CHK=`tail -1 $LOCAL_CMD_PID_FILE | cut -f2 -d' '`
   if [ "$CHK" == "START" ]
@@ -109,6 +107,9 @@ function do_status() {
   fi
 }
 
+#design choice:
+# either we have one port per app, and we can have a "start" link
+# either we have only one web server port (with appID in URL), but we can't start the app
 function do_http() {
   #http://paulbuchheit.blogspot.com/2007/04/webserver-in-bash.html
   RESP=/tmp/webresp
@@ -118,6 +119,7 @@ function do_http() {
     ( cat $RESP ) | nc -l -p 9000 | (
       REQ_HEADER=`while read L && [ " " "<" "$L" ] ; do echo "$L" ; done`
       REQ=`echo "${REQ_HEADER}" | head -1`
+      HOST=`echo "${REQ_HEADER}" | grep "Host: " | head -1 | cut -d' ' -f2`
       echo "[`date '+%Y-%m-%d %H:%M:%S'`] $REQ"
       REQPATH=`echo -n $REQ | cut -d' ' -f2`
       REQPATH0=`echo $REQPATH | cut -d'/' -f2` #appID
@@ -125,44 +127,94 @@ function do_http() {
       REQPATH2=`echo $REQPATH | cut -d'/' -f4` #par1
       #TODO factor code
       LOCAL_MON_LOG_FILE=$D_PID/$REQPATH0.mon.log
+      LOCAL_MON_PID_FILE=$D_PID/$REQPATH0.mon.pid
       LOCAL_CMD_PID_FILE=$D_PID/$REQPATH0.cmd.pid
-      if [ $REQPATH1 == "monlog" ]
+      MIME="text/plain"
+      if [ "${REQPATH0}" != "" ]
       then
-        if [ -e $LOCAL_MON_LOG_FILE ]
+        if [ "$REQPATH1" == "" ] || [ "$REQPATH1" == "stop" ]
         then
-          N=`echo "$REQPATH2" | grep "^[0-9]*$" | head -1`
-          if [ "$N" == "" ] ; then N=4 ; fi
-          if [ $N -gt 100 ] ; then N=4 ; fi
-          ANS=`tail -$N $LOCAL_MON_LOG_FILE`
-        else
-          ANS="no monlog for app id ${REQPATH0}"
-        fi
-      elif [ $REQPATH1 == "status" ]
-      then
-        do_status $LOCAL_CMD_PID_FILE
-        STATUS=$?
-        if [ "$STATUS" == "0" ]
-        then
-          CMT="Running."
-        else
-          CMT="Not running."
-        fi
-        ANS="$STATUS $CMT"
-      else
-        ANS="unknown command"
-      fi
-      REP="${ANS}
+          if [ "$REQPATH1" == "stop" ]
+          then
+            do_stop $LOCAL_CMD_PID_FILE $LOCAL_MON_PID_FILE
+          fi
+          do_status $LOCAL_CMD_PID_FILE
+          STATUS=$?
+          if [ "$STATUS" == "0" ]
+          then
+            STATUSTEXT="Running."
+          else
+            STATUSTEXT="Not running."
+          fi
+          MIME="text/html"
+          ANS="
+<html>
+<body>
+<h2>$0 HTTP API for application <em>${REQPATH0}</em></h2>
 
-${REQ_HEADER}"
+<h3>Status</h3>
+<p>${STATUS}: ${STATUSTEXT}</p>
+
+<h3>Actions</h3>
+<ul>
+<li><a href=\"http://${HOST}/${REQPATH0}/stop\">Stop</a></li>
+</ul>
+
+<h3>Info</h3>
+<ul>
+<li>host: ${HOST}</li>
+</ul>
+
+<h3>Monitor logs</h3>
+<pre>
+`tail -30 $LOCAL_MON_LOG_FILE`
+</pre>
+
+<h3>Request</h3>
+<pre>
+${REQ_HEADER}
+</pre>
+
+</body>
+</html>
+        "
+        elif [ $REQPATH1 == "monlog" ]
+        then
+          if [ -e $LOCAL_MON_LOG_FILE ]
+          then
+            N=`echo "$REQPATH2" | grep "^[0-9]*$" | head -1`
+            if [ "$N" == "" ] ; then N=30 ; fi
+            if [ $N -gt 100 ] ; then N=30 ; fi
+            ANS=`tail -$N $LOCAL_MON_LOG_FILE`
+          else
+            ANS="no monlog for app id ${REQPATH0}"
+          fi
+        elif [ $REQPATH1 == "status" ]
+        then
+          do_status $LOCAL_CMD_PID_FILE
+          STATUS=$?
+          if [ "$STATUS" == "0" ]
+          then
+            CMT="Running."
+          else
+            CMT="Not running."
+          fi
+          ANS="$STATUS $CMT"
+        else
+          ANS="unknown command"
+        fi
+      else
+        ANS="unknown appIappID"
+      fi
       cat >$RESP <<EOF
 HTTP/1.0 200 OK
 Cache-Control: private
-Content-Type: text/plain
+Content-Type: ${MIME}
 Server: bash/2.0
 Connection: Close
-Content-Length: ${#REP}
+Content-Length: ${#ANS}
 
-$REP
+$ANS
 EOF
     )
   done
@@ -174,7 +226,7 @@ EOF
 
 case "$ACT" in
   'start')
-    do_status 
+    do_status $CMD_PID_FILE
     if [ $? == 0 ]
     then
       echo "ERROR: $ACT: process already running"
@@ -183,16 +235,16 @@ case "$ACT" in
     fi
     ;;
   'stop')
-    do_status 
+    do_status $CMD_PID_FILE
     if [ $? == 0 ]
     then
-      do_stop
+      do_stop $CMD_PID_FILE $MON_PID_FILE
     else
       echo "ERROR: $ACT: process already running"
     fi
     ;;
   'status')
-    do_status
+    do_status $CMD_PID_FILE
     STATUS=$?
     if [ $STATUS == 0 ]
     then
@@ -206,7 +258,7 @@ case "$ACT" in
     do_http
     ;;
   *)
-    echo <<EOF
+    cat <<EOF
 Unknown command: $ACT
 Usage:
   $0 start <appID> <command-line>
